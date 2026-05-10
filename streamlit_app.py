@@ -7,31 +7,30 @@ st.set_page_config(page_title="CSF Action Tracker", layout="wide")
 @st.cache_data
 def load_data():
     try:
-        # Load and immediately skip the title row
+        # Load data skipping the title row
         df = pd.read_csv('tracker_data.csv', skiprows=1)
-        
-        # 1. Clean column names (REALLY important for matching 'Progress %')
         df.columns = df.columns.str.strip()
         
-        # 2. FORCE PROGRESS EXTRACTION
-        # We convert to string first, remove any % signs, then turn back to number
+        # 1. CLEAN PROGRESS: Force it to be a Float (decimal) right away
         if 'Progress %' in df.columns:
-            df['Progress %'] = df['Progress %'].astype(str).str.replace('%', '')
+            # Remove any special characters and convert to float
+            df['Progress %'] = df['Progress %'].astype(str).str.replace('%', '').str.strip()
             df['Progress %'] = pd.to_numeric(df['Progress %'], errors='coerce').fillna(0.0)
             
-            # If the CSV has whole numbers (like 75), convert them to decimals (0.75)
-            # Streamlit's editor prefers 0.0 - 1.0 for percentage bars/logic
-            df.loc[df['Progress %'] > 1, 'Progress %'] = df['Progress %'] / 100
+            # If values are whole numbers (75), convert to decimals (0.75)
+            # This logic only triggers if the max value is > 1.0
+            if df['Progress %'].max() > 1.0:
+                df['Progress %'] = df['Progress %'] / 100.0
         
-        # 3. CLEAN DEADLINES
+        # 2. CLEAN DEADLINES
         if 'Deadline' in df.columns:
             df['Deadline'] = pd.to_datetime(df['Deadline'], errors='coerce').dt.date
         
-        # 4. APPLY HEALTH LOGIC (🔴, 🟡, 🟢)
+        # 3. APPLY HEALTH LOGIC
         def get_health(row):
             today = date.today()
             deadline = row.get('Deadline')
-            progress = row.get('Progress %', 0)
+            progress = float(row.get('Progress %', 0.0))
             status = str(row.get('Status', '')).strip()
             
             if status == 'Completed' or progress >= 1.0:
@@ -42,15 +41,12 @@ def load_data():
                 return "🟡 AT RISK"
             return "⚪ Pending"
 
-        # Insert Health at the very beginning
-        health_col = df.apply(get_health, axis=1)
-        if 'Health' in df.columns:
-            df['Health'] = health_col
-        else:
-            df.insert(0, 'Health', health_col)
+        # Force Health column to be a standard string/object type
+        df.insert(0, 'Health Status', df.apply(get_health, axis=1).astype(str))
             
         return df
     except Exception as e:
+        # If it crashes, show the specific row/error to help us debug
         st.error(f"Critical Data Error: {e}")
         return None
 
@@ -60,33 +56,39 @@ if df is not None:
     st.title("🚀 CSF Team Action Tracker")
     
     # --- DASHBOARD ---
-    c1, c2, c3, c4 = st.columns(4)
-    health_counts = df['Health'].value_counts()
+    # We calculate counts using the new column name
+    health_counts = df['Health Status'].value_counts()
     
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Overdue (Red)", health_counts.get("🔴 OVERDUE", 0))
     c2.metric("At Risk (Yellow)", health_counts.get("🟡 AT RISK", 0))
     c3.metric("On Track (Green)", health_counts.get("🟢 Done", 0))
-    # Shows average as a whole number (e.g., 0.85 -> 85%)
-    c4.metric("Avg. Completion", f"{int(df['Progress %'].mean() * 100)}%")
+    
+    # Display avg progress as a percentage
+    avg_p = float(df['Progress %'].mean())
+    c4.metric("Avg. Completion", f"{int(avg_p * 100)}%")
 
     # --- TRACKER ---
     st.divider()
     
     # Sidebar Filters
-    owners = sorted(df['Owner'].dropna().unique().tolist()) if 'Owner' in df.columns else []
-    selected_owner = st.sidebar.multiselect("Filter by Owner", options=owners, default=owners)
-    
-    filtered_df = df[df['Owner'].isin(selected_owner)] if 'Owner' in df.columns else df
+    if 'Owner' in df.columns:
+        owners = sorted(df['Owner'].dropna().unique().tolist())
+        selected_owner = st.sidebar.multiselect("Filter by Owner", options=owners, default=owners)
+        filtered_df = df[df['Owner'].isin(selected_owner)]
+    else:
+        filtered_df = df
 
+    # Final Table Configuration
     st.data_editor(
         filtered_df,
         num_rows="dynamic",
         column_config={
-            "Health": st.column_config.TextColumn("Health", width="small"),
+            "Health Status": st.column_config.TextColumn("Health", width="small"),
             "Deadline": st.column_config.DateColumn("Deadline", format="YYYY-MM-DD"),
             "Progress %": st.column_config.NumberColumn(
                 "Progress (%)",
-                help="Enter 1.0 for 100%, 0.5 for 50%",
+                help="1.0 = 100%, 0.5 = 50%",
                 min_value=0.0,
                 max_value=1.0,
                 step=0.01,
@@ -102,5 +104,5 @@ if df is not None:
 
     # --- SAVE ---
     st.divider()
-    csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button("💾 Save & Download Updated Tracker", data=csv, file_name='csf_tracker.csv', mime='text/csv')
+    csv_out = df.to_csv(index=False).encode('utf-8')
+    st.download_button("💾 Download Updated Tracker", data=csv_out, file_name='csf_tracker.csv', mime='text/csv')
