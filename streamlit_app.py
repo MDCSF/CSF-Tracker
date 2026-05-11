@@ -1,99 +1,76 @@
 import streamlit as st
 import pandas as pd
 from datetime import date
+from pyairtable import Table
 
 st.set_page_config(page_title="CSF Action Dashboard", layout="wide")
 
-@st.cache_data
-def load_data():
-    try:
-        # Load data skipping the title row
-        df = pd.read_csv('tracker_data.csv', skiprows=1)
-        df.columns = df.columns.str.strip()
-        
-        # --- AGGRESSIVE PROGRESS EXTRACTION ---
-        if 'Progress %' in df.columns:
-            # 1. Convert to string and remove symbols like %, spaces, or commas
-            df['Progress %'] = df['Progress %'].astype(str).str.replace('%', '').str.strip()
-            
-            # 2. Convert to actual numbers, turning errors into 0
-            df['Progress %'] = pd.to_numeric(df['Progress %'], errors='coerce').fillna(0.0)
-            
-            # 3. Handle the "Whole vs Decimal" logic:
-            # If the CSV has "75", we turn it into 0.75. If it has "1", it stays 1.0.
-            # We only divide by 100 if the numbers are clearly whole numbers (greater than 1)
-            if df['Progress %'].max() > 1.0:
-                df['Progress %'] = df['Progress %'] / 100.0
-        
-        # --- DATE CLEANING ---
-        if 'Deadline' in df.columns:
-            df['Deadline'] = pd.to_datetime(df['Deadline'], errors='coerce').dt.date
-            
-        # --- COLUMN CLEANUP ---
-        # Explicitly keep only the columns we want to avoid junk
-        valid_cols = ['Task ID', 'Task Description', 'Owner', 'Priority', 'Deadline', 'Status', 'Progress %', 'Comments']
-        # Only keep columns that actually exist in the file
-        df = df[[c for c in valid_cols if c in df.columns]]
-        
-        return df
-    except Exception as e:
-        st.error(f"Data extraction error: {e}")
-        return None
+# --- 1. CONNECTION ---
+# This tells the app to look in the "Secrets" box you just filled out
+api_key = st.secrets["AIRTABLE_API_KEY"]
+base_id = st.secrets["AIRTABLE_BASE_ID"]
+table_name = st.secrets["AIRTABLE_TABLE_NAME"]
+at_table = Table(api_key, base_id, table_name)
 
-# Persist data in session
-if 'main_df' not in st.session_state:
-    st.session_state.main_df = load_data()
+@st.cache_data(ttl=30)
+def load_live_data():
+    records = at_table.all()
+    # Pull data and keep the unique Airtable ID for syncing
+    data = [{**rec['fields'], 'airtable_id': rec['id']} for rec in records]
+    df = pd.DataFrame(data)
+    
+    # Force formatting
+    if 'Progress %' in df.columns:
+        df['Progress %'] = pd.to_numeric(df['Progress %'], errors='coerce').fillna(0.0)
+    if 'Deadline' in df.columns:
+        df['Deadline'] = pd.to_datetime(df['Deadline'], errors='coerce').dt.date
+    return df
 
-df = st.session_state.main_df
+df = load_live_data()
 
-# --- HEALTH LOGIC ---
+# --- 2. HEALTH & DASHBOARD ---
 def get_health(row):
     today = date.today()
     deadline = row.get('Deadline')
-    progress = row.get('Progress %', 0)
-    status = str(row.get('Status', '')).strip()
-    
-    if status == 'Completed' or progress >= 1.0: return "🟢 Done"
+    progress = row.get('Progress %', 0.0)
+    if row.get('Status') == 'Completed' or progress >= 1.0: return "🟢 Done"
     if pd.notnull(deadline) and deadline < today: return "🔴 OVERDUE"
     if pd.notnull(deadline) and (deadline - today).days <= 7: return "🟡 AT RISK"
     return "⚪ Pending"
 
 df['Health'] = df.apply(get_health, axis=1)
 
-# --- DASHBOARD ---
-st.title("🚀 CSF Action Dashboard")
+# Position Health at Column 3 (Index 2)
+cols = list(df.columns)
+if 'Health' in cols:
+    cols.insert(2, cols.pop(cols.index('Health')))
+    df = df[cols]
 
+st.title("🚀 CSF Global Action Dashboard")
+
+# Visual Metrics
 c1, c2, c3, c4 = st.columns(4)
-overdue_df = df[df['Health'] == "🔴 OVERDUE"]
-at_risk_df = df[df['Health'] == "🟡 AT RISK"]
-
+h_counts = df['Health'].value_counts()
 c1.metric("Total Items", len(df))
-c2.metric("🔴 Overdue", len(overdue_df))
-c3.metric("🟡 At Risk", len(at_risk_df))
-c4.metric("Avg. Progress", f"{int(df['Progress %'].mean() * 100)}%")
+c2.metric("🔴 Overdue", h_counts.get("🔴 OVERDUE", 0))
+c3.metric("🟡 At Risk", h_counts.get("🟡 AT RISK", 0))
+c4.metric("Avg. Completion", f"{int(df['Progress %'].mean() * 100)}%")
 
+# Bar Chart: Late Items by Owner
+st.subheader("⚠️ Red Alert: Who is Late?")
+overdue_df = df[df['Health'] == "🔴 OVERDUE"]
+if not overdue_df.empty:
+    st.bar_chart(overdue_df.groupby('Owner').size())
+else:
+    st.success("No overdue items! Great job team. ✅")
+
+# --- 3. LIVE EDITOR ---
 st.divider()
-
-# Charts
-l, r = st.columns(2)
-with l:
-    st.subheader("📊 Status Distribution")
-    st.bar_chart(df['Status'].value_counts())
-with r:
-    st.subheader("⚠️ Red Alert: Who is Late?")
-    if not overdue_df.empty:
-        st.bar_chart(overdue_df.groupby('Owner').size())
-    else:
-        st.success("No overdue items. ✅")
-
-# --- TABLE ---
-st.subheader("📝 Master Action Tracker")
-owners = sorted(df['Owner'].dropna().unique().tolist())
-sel_owner = st.sidebar.multiselect("Filter Team Member", options=owners, default=owners)
-f_df = df[df['Owner'].isin(sel_owner)]
+st.subheader("📝 Live Action Tracker")
+st.info("💡 Edit the table and click 'Sync' below. No GitHub upload required!")
 
 edited_df = st.data_editor(
-    f_df,
+    df,
     num_rows="dynamic",
     use_container_width=True,
     hide_index=True,
@@ -101,14 +78,23 @@ edited_df = st.data_editor(
         "Health": st.column_config.TextColumn("Health", width="small"),
         "Progress %": st.column_config.NumberColumn("Progress (%)", format="%.2f", min_value=0, max_value=1),
         "Deadline": st.column_config.DateColumn("Deadline"),
-        "Status": st.column_config.SelectboxColumn(options=["Not Started", "In Progress", "Completed", "On Hold"]),
         "Comments": st.column_config.TextColumn("Comments", width="large")
     }
 )
 
-# --- SAVE ---
-if st.button("💾 Sync & Prepare for Save"):
-    st.session_state.main_df = edited_df
-    csv = edited_df.to_csv(index=False).encode('utf-8')
-    st.download_button("Download Updated CSV", data=csv, file_name='tracker_data.csv')
-    st.success("Synced! Download and upload to GitHub to lock in changes.")
+# --- 4. THE SYNC BUTTON ---
+if st.button("💾 Sync All Changes to Cloud"):
+    with st.spinner("Updating CSF Cloud..."):
+        for _, row in edited_df.iterrows():
+            fields = row.drop('Health').drop('airtable_id', errors='ignore').to_dict()
+            # Convert date to string for Airtable
+            if fields.get('Deadline'): fields['Deadline'] = str(fields['Deadline'])
+            
+            if 'airtable_id' in row and pd.notnull(row['airtable_id']):
+                at_table.update(row['airtable_id'], fields)
+            else:
+                at_table.create(fields)
+        
+        st.success("Changes Saved Permanently! Dashboard Updated.")
+        st.cache_data.clear()
+        st.rerun()
