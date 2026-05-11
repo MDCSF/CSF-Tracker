@@ -12,21 +12,17 @@ base_id = st.secrets["AIRTABLE_BASE_ID"]
 table_name = st.secrets["AIRTABLE_TABLE_NAME"]
 at_table = Table(api_key, base_id, table_name)
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=5)
 def load_live_data():
-    records = at_table.all()
-    # Pull data and keep the unique Airtable ID for syncing
-    data = [{**rec['fields'], 'airtable_id': rec['id']} for rec in records]
-    df = pd.DataFrame(data)
-    
-    # Force formatting
-    if 'Progress %' in df.columns:
-        df['Progress %'] = pd.to_numeric(df['Progress %'], errors='coerce').fillna(0.0)
-    if 'Deadline' in df.columns:
-        df['Deadline'] = pd.to_datetime(df['Deadline'], errors='coerce').dt.date
-    return df
-
-df = load_live_data()
+    try:
+        records = at_table.all()
+        data = [{**rec.get('fields', {}), 'airtable_id': rec.get('id')} for rec in records]
+        return pd.DataFrame(data)
+    except Exception as e:
+        # This will tell us if it's a 404 (Table/Base name wrong) or 401 (Token wrong)
+        st.error(f"🔍 Connection Debugger: {e}")
+        st.info("Check your Table Name in Airtable vs your Secrets. They must be identical.")
+        return pd.DataFrame()
 
 # --- 2. HEALTH & DASHBOARD ---
 def get_health(row):
